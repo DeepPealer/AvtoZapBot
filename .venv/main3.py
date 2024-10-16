@@ -12,9 +12,42 @@ import json
 bot = telebot.TeleBot('8134752441:AAFmX7Tf1wbrjgsZoyniL3ELfGKlQhlSxPQ') #Remember to replace with your actual token
 
 USER_DATA_FILE = "user_data.json"
+PICKUP_POINTS_FILE = "pickup_points.json"
+
+def reencode_json_file(filename, original_encoding='cp1251'):  # Try cp1251 or other likely encodings
+    try:
+        with open(filename, 'r', encoding=original_encoding) as f: # Read with the *original* encoding
+            data = json.load(f)
+    except UnicodeDecodeError as e:
+        print(f"Error decoding with {original_encoding}: {e}") # For troubleshooting
+        return False # Couldn't decode with the specified encoding
+
+    with open(filename, 'w', encoding="utf-8") as f: # Write with UTF-8
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+    print(f"File {filename} re-encoded to UTF-8.")
+    return True
+
+if reencode_json_file(USER_DATA_FILE):
+        print("Re-encoding successful.") # Or proceed with your bot code here
+else:
+        print("Re-encoding failed. Please check the original encoding.")
+def load_data(filename):
+    try:
+        with open(filename, "r", encoding="utf-8") as f: # Added encoding for potential non-ASCII characters
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print(f"{filename} not found or invalid JSON. Creating a new one.")
+        return {} if filename == USER_DATA_FILE else [] # Empty list for pickup points
+
+def save_data(data, filename):
+    with open(filename, "w", encoding="utf-8") as f: # Encoding here as well
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
 def load_user_data():
     try:
-        with open(USER_DATA_FILE, "r") as f:
+        with open(USER_DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):  # Handle missing or invalid JSON
         print("User data file not found or invalid JSON. Creating a new one.")
@@ -22,7 +55,9 @@ def load_user_data():
 
 def save_user_data():
     with open(USER_DATA_FILE, "w") as f:
-        json.dump(user_data, f, indent=4)
+        json.dump(user_data, f, indent=4, ensure_ascii=False)
+
+pickup_points = load_data(PICKUP_POINTS_FILE)
 
 waiting_for_vin = False
 user_data = {}
@@ -291,8 +326,11 @@ def get_car_info(vin, chat_id):
                 save_user_data()
                 return True
             else:
-                print("Информация о машине не найдена.")
-                bot.send_message(chat_id, "Информация о машине не найдена.")
+                markup = telebot.types.InlineKeyboardMarkup()
+                markup.add(
+                    telebot.types.InlineKeyboardButton(text="Связь с менеджером", callback_data=f"contact_manager"))
+                bot.send_message(chat_id, "Информация о машине не найдена. Хотите связаться с менеджером?",
+                                 reply_markup=markup)
                 return False
         except json.JSONDecodeError as e:
             print(f"JSON decoding error: {e}")
@@ -300,8 +338,101 @@ def get_car_info(vin, chat_id):
             return False
 
     else:
-        bot.send_message(chat_id, "Не удалось получить информацию о машине. Проверьте VIN-код.")
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(
+            telebot.types.InlineKeyboardButton(text="Связь с менеджером", callback_data=f"contact_manager"))
+        bot.send_message(chat_id, "Информация о машине не найдена. Хотите связаться с менеджером?",
+                         reply_markup=markup)
         return False
+
+@bot.callback_query_handler(func=lambda call: call.data == "contact_manager")
+def handle_contact_manager(call):
+    chat_id = str(call.message.chat.id)
+    global incorrect_vin
+    user = call.from_user  # Get the User object from the callback
+    username = user.username or user.first_name  # Use username if available, otherwise first name
+    user_id = user.id  # Get the user's telegram ID
+    for admin_id in [786320574]:  # Replace with your admin IDs
+        bot.send_message(admin_id, f"Проблема по запросу на VIN: '{incorrect_vin}' от @{username}")
+    bot.send_message(chat_id,"Ваша заявка обрабатывается, мы с вами свяжемся(проверьте настройки приватности профиля)")
+@bot.callback_query_handler(func=lambda call: call.data == "order_now")
+def handle_order_now(call):
+    print("Order now")
+    chat_id = str(call.message.chat.id)
+    order_parts(chat_id,call)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('pickup_point_'))
+def handle_pickup_point_selection(call):
+    chat_id = str(call.message.chat.id)
+    selected_point = call.data.split('_')[2]
+    user_data[chat_id]['selected_pickup_point'] = selected_point
+    save_user_data()
+    bot.send_message(chat_id, f"Выбран пункт выдачи: {selected_point}")
+
+    # After selecting a pickup point, ask if they want to order:
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton(text="Заказать", callback_data=f"order_now"))
+    bot.send_message(chat_id, "Теперь вы можете оформить заказ:", reply_markup=markup) # Correct this line
+def show_pickup_points(chat_id):
+    if not pickup_points:
+        bot.send_message(chat_id, "Пункты выдачи недоступны.")
+        return
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    for point in pickup_points:
+        markup.add(telebot.types.InlineKeyboardButton(text=point['name'], callback_data=f"pickup_point_{point['name']}"))
+
+    bot.send_message(chat_id, "Выберите пункт выдачи:", reply_markup=markup)
+
+def order_parts(chat_id,call):
+    if 'cart' not in user_data[chat_id] or not user_data[chat_id]['cart']:
+        bot.send_message(chat_id, "Ваша корзина пуста. Нечего заказывать.")
+        return
+
+    if 'selected_pickup_point' not in user_data[chat_id]:
+        show_pickup_points(chat_id) # Ask for pickup point if not selected
+        return
+
+    user = call.from_user  # Get the User object from the callback
+    username = user.username or user.first_name  # Use username if available, otherwise first name
+    user_id = user.id  # Get the user's telegram ID
+
+
+    cart_items = user_data[chat_id]['cart']
+    order_details = f"Новый заказ от пользователя [@{username}]\n"
+    total_price = 0  # Placeholder for price calculation (you'll need to implement actual pricing)
+    for part_oem, part_data in cart_items.items():
+        order_details += f"- {part_data['name']} (Артикул: {part_oem}) x {part_data['quantity']}\n"
+
+
+    # Implement pricing logic here. Example:
+    for part_oem, part_data in cart_items.items():
+        # Example: assume price is stored in unit_data
+        if 'unit_data' in user_data[chat_id]:
+          part_price = next((part.get('price') for part in user_data[chat_id]['unit_data']['parts'] if part['oemCode'] == part_oem), None)
+          if part_price is not None:
+            total_price += part_price * part_data['quantity']
+          else: #Add logging, or whatever you like to do for the edgecase
+            order_details += f"Цена для {part_data['name']} не найдена\n"
+
+        else:#Add logging, or whatever you like to do for the edgecase
+            order_details += f"Цена для {part_data['name']} не найдена\n"
+
+
+    order_details += f"Пункт выдачи: {user_data[chat_id]['selected_pickup_point']}\n"
+    order_details += f"Контакт пользователя: (tg://user?id={user_id}) (ID: {chat_id}):\n" # Assuming you want the Telegram username
+    order_details += f"Общая цена: {total_price}\n" # Add total price
+
+    # Send order details to admin(s)
+    for admin_id in [786320574]:  # Replace with your admin IDs
+        bot.send_message(admin_id, order_details)
+
+    bot.send_message(chat_id, "Ваш заказ принят!")
+
+
+
+    user_data[chat_id]['cart'] = {} # Clear cart after order
+    del user_data[chat_id]['selected_pickup_point'] # Clear selected pickup point
+    save_user_data()
 
 
 def get_details(ssd, vehicle_id, catalog_id, group_id, parent_group_id, catalog_type, catalog_aggregator, chat_id):
@@ -368,7 +499,7 @@ def ask_for_vin(message):
     waiting_for_vin = True #Critical
 
     bot.register_next_step_handler(msg, process_vin_step)
-
+incorrect_vin = ''
 def process_vin_step(message):
     global waiting_for_vin
     chat_id = str(message.chat.id)
@@ -379,7 +510,6 @@ def process_vin_step(message):
     if message.text == "Новый запрос":
         handle_new_request(message)
         return
-
     if message.text == "Связь с менеджером":
         handle_contact_manager(message)
         return
@@ -388,7 +518,15 @@ def process_vin_step(message):
         waiting_for_vin = False
         save_user_data()
     else:
-        msg = bot.send_message(chat_id, "Попробуйте ввести VIN-код еще раз. Ошибка обработки данных.")
+        global incorrect_vin
+        incorrect_vin = message.text
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(
+            telebot.types.InlineKeyboardButton(text="Связь с менеджером", callback_data=f"contact_manager"))
+        msg = bot.send_message(chat_id, "Информация о машине не найдена.")
+        bot.send_message(chat_id, " Хотите связаться с менеджером? Или попробуйте еще раз",
+                         reply_markup=markup)
+
         bot.register_next_step_handler(msg, process_vin_step)  # Re-register for another attempt
 
 def remove_from_cart(chat_id, part_oem):
@@ -407,7 +545,7 @@ def remove_from_cart(chat_id, part_oem):
 
 def create_navigation_keyboard(items, callback_prefix, chat_id, current_state):  # Универсальная функция для создания клавиатуры
     markup = telebot.types.InlineKeyboardMarkup()
-    back_button = create_back_button(current_state)
+    #ack_button = create_back_button(current_state)
 
     if back_button:
       markup.row(back_button)
@@ -417,11 +555,10 @@ def create_navigation_keyboard(items, callback_prefix, chat_id, current_state): 
         markup.add(button)
     return markup
 
-def create_back_button(current_state):
-    if current_state == 'start':
-      return None
-    return telebot.types.InlineKeyboardButton("Назад", callback_data=f"navigate_back")
-
+#def create_back_button(current_state):
+#    if current_state == 'start':
+#    return telebot.types.InlineKeyboardButton("Назад", callback_data=f"navigate_back")
+#
 def get_part_details(chat_id, part_oem):
     """Retrieves part name, cross type, and price."""
     if chat_id in user_data and 'unit_data' in user_data[chat_id]:
@@ -457,7 +594,7 @@ def get_part_details(chat_id, part_oem):
                                   int, float)) else lowest_price
                                   return part['name'], cross_type, formatted_price, prices  # return all prices
                               else:
-                                  return part['name'], cross_type, "Цена не найдена"
+                                  return part['name'], cross_type, "Цена не найдена", []
 
                           except (KeyError, json.JSONDecodeError, TypeError) as e: # Include TypeError
                               print(f"Error getting product card details: {e}")
@@ -472,7 +609,7 @@ def get_part_details(chat_id, part_oem):
                   print("nsiPartId not found for this part.")
                   return None, None, None, None
 
-    return None, None, None # Part not found in the data
+    return None, None, None, None# Part not found in the data
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('part_'))
 def callback_query_part(call):
@@ -560,81 +697,87 @@ def get_unit_info(catalog_id, ssd, unit_id, catalog_type, catalog_aggregator, ch
         "Authorization-Domain": "https://don.rossko.ru",
     }
     url = f"https://oem-catalog.rossko.ru/api/unit/info?catalogId={data['catalog_id']}&ssd={data['ssd']}&unitId={unit_id}&deliveryType=000000001&CurrencyCode=643&addressGuid=&catalogType={data['catalog_type']}&catalogAggregator={data['catalog_aggregator']}"
-    response = make_request(url,3,headers)
+    response = make_request(url, 3, headers)
+
     if response:
         try:
             unit_data = response.json()
-
-            user_data[chat_id]['unit_data'] = unit_data
+            user_data[chat_id]['unit_data'] = unit_data  # Store unit data
 
             if unit_data and unit_data.get('unit'):
-                text = "\nДетали в выбранном юните:\n"
-                print(url)
+
+                # 1. Chunking method to avoid long messages:
+                parts = unit_data['parts']
+                CHUNK_SIZE = 10
+                for i in range(0, len(parts), CHUNK_SIZE):
+                    chunk = parts[i:i + CHUNK_SIZE]
+                    text = "Детали в выбранном юните:\n"
+                    for part in chunk:
+                        part_name = part["name"]
+                        part_oem = part["oemCode"]
+                        part_code = part.get("codeOnImage", "")
+                        text += f'№{part_code}. {part_name}, Артикул: {part_oem}, \n\n'
+                    bot.send_message(chat_id, text)
+
+                # 2. Optional: Send parts as file if there are many:
+                if len(parts) > 50: # Example threshold - adjust if needed
+                    try:
+                        parts_file = create_parts_file(parts)
+                        bot.send_document(chat_id, parts_file)
+                        parts_file.close()  # Close the file after sending
+                        os.remove("parts.txt") #Remove the file after it is sent
+                    except Exception as e:
+                        print(f"Error sending parts file: {e}")
+                        bot.send_message(chat_id, "Ошибка отправки файла с деталями. Детали отправлены в виде текста.")
+
+
+                # Create keyboard for part selection:
                 markup = telebot.types.InlineKeyboardMarkup()
-                part_dict = {part['oemCode']: part['name'] for part in unit_data['parts']}
-
-                for part in unit_data['parts']:
-                    part_name = part["name"]
-                    part_oem = part["oemCode"]
-                    part_code = part.get("codeOnImage", "")
-                    text += f'№{part_code}. {part_name}, Артикул: {part_oem}, \n\n'
-
-                # Send the part list FIRST
-                bot.send_message(chat_id, text)
-
-
-                # Create the keyboard
-                for i in range(0, len(unit_data['parts']), 6):
+                for i in range(0, len(parts), 6):  # Display up to 6 buttons per row
                     row = []
                     for j in range(6):
                         index = i + j
-                        if index < len(unit_data['parts']):
-                            part_code = unit_data['parts'][index].get("codeOnImage", "")
-                            row.append(telebot.types.InlineKeyboardButton(text=part_code, callback_data=f"part_{unit_data['parts'][index]['oemCode']}"))
+                        if index < len(parts):
+                            part_code = parts[index].get("codeOnImage", "")
+                            row.append(telebot.types.InlineKeyboardButton(text=part_code, callback_data=f"part_{parts[index]['oemCode']}"))
                     markup.add(*row)
 
+
+
+                # Send image:
                 image_url = unit_data['unit']['largeImageUrl'].replace("%size%", "source")
                 try:
                     image_response = requests.get(image_url, stream=True)
-                    image_response.raise_for_status()
-                    image_path = "temp_image.jpg"
-                    with open(image_path, 'wb') as f:
+                    image_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+                    with open("temp_image.jpg", 'wb') as f:
                         for chunk in image_response.iter_content(chunk_size=8192):
                             f.write(chunk)
-                    with open(image_path, 'rb') as img:
+                    with open("temp_image.jpg", 'rb') as img:
                         bot.send_photo(chat_id, img, reply_markup=markup)
-                    os.remove(image_path)
+                    os.remove("temp_image.jpg")
+
                 except requests.exceptions.RequestException as e:
                     print(f"Ошибка при загрузке изображения: {e}")
-                    bot.send_message(chat_id, f"Ошибка при загрузке изображения: {e}\nСсылка на фото (попробуйте вручную): {image_url}")
-                    bot.send_message(chat_id, text, reply_markup=markup)
-                message_chunks = []
+                    bot.send_message(chat_id, f"Ошибка при загрузке изображения:\nСсылка на фото (попробуйте вручную): {image_url}")  # Provide image URL if download fails
+                    bot.send_message(chat_id, "Выберите деталь:", reply_markup=markup) # Send keyboard even if image fails
 
-                markup = telebot.types.InlineKeyboardMarkup()
-                for i in range(0, len(unit_data['parts']), 10):  # Adjust chunk size (10 here) as needed
-                    chunk_text = ""
-                    for j in range(10):
-                        index = i + j
-                        if index < len(unit_data['parts']):
-                            part = unit_data['parts'][index]
-                            part_name = part["name"]
-                            part_oem = part["oemCode"]
-                            part_code = part.get("codeOnImage", "")
-                            chunk_text += f'№{part_code}. {part_name}, Артикул: {part_oem}, \n\n'
-                    message_chunks.append(chunk_text)
+
             else:
-                bot.send_message(chat_id, "Информация о юните не найдена.")
+                bot.send_message(chat_id, "Информация о юните не найдена.") # More specific message
+
+
         except json.JSONDecodeError as e:
             print(f"JSON decoding error in get_unit_info: {e}")
             bot.send_message(chat_id, "Ошибка обработки данных.")
     else:
-        bot.send_message(chat_id, "Не удалось получить информацию о юните.")
+        bot.send_message(chat_id, "Не удалось получить информацию о юните. Проверьте подключение к интернету или попробуйте позже.")  # More informative message
+
 
 def create_group_keyboard(groups, chat_id, parent_id=None):
     markup = telebot.types.InlineKeyboardMarkup()
-    if parent_id is not None:
-        markup.add(telebot.types.InlineKeyboardButton("Назад",
-                                                      callback_data=f"group_back_{parent_id if parent_id != 'None' else None}"))
+    #if parent_id is not None:
+    #    markup.add(telebot.types.InlineKeyboardButton("Назад",
+    #                                                  callback_data=f"group_back_{parent_id if parent_id != 'None' else None}"))
     available_groups = [group for group in groups if group.get("parentId") == parent_id]
     for group in available_groups:
         markup.add(telebot.types.InlineKeyboardButton(text=group['name'], callback_data=f"group_{group['id']}_{parent_id}"))
@@ -731,6 +874,7 @@ def handle_new_request(message):
 @bot.message_handler(func=lambda message: message.text == "Связь с менеджером")
 def handle_contact_manager(message):
     chat_id = str(message.chat.id)
+
     bot.send_message(chat_id, "Для связи с менеджером, пожалуйста, нажмите кнопку ниже")
 
 @bot.message_handler(func=lambda message: message.text == "Корзина")
@@ -802,7 +946,7 @@ def handle_start(message):
         ask_for_vin(message)
 
     save_user_data()
-    print(user_data[chat_id])
+
 @bot.callback_query_handler(func=lambda call: call.data == 'use_saved_vin')
 def use_saved_vin(call):
 
@@ -832,9 +976,15 @@ def handle_message(message):
     if message.text == "Новый запрос":
         print("Новый")
         handle_new_request(message)
-
+    if message.text == 'Заказать':
+        print("Заказать")# If it's /order
+        if 'cart' not in user_data[chat_id] or not user_data[chat_id]['cart']:
+            bot.send_message(chat_id, "Ваша корзина пуста. Добавьте детали перед заказом.")
+            handle_start(message)  # Redirect to the start menu
+        else:
+            show_pickup_points(chat_id)
     if message.text == "Связь с менеджером":
-        print("Связь")
+
         handle_contact_manager(message)
     save_user_data()  # Moved outside conditional
 
@@ -886,19 +1036,35 @@ def callback_query_unit(call):
 
 def create_main_menu(chat_id):
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+
     new_request_button = telebot.types.KeyboardButton("Новый запрос")
     cart_button = telebot.types.KeyboardButton("Корзина")
-    contact_manager_button = telebot.types.KeyboardButton("Связь с менеджером")
+    contact_manager_button = telebot.types.KeyboardButton("Связь с менеджером")  # Add contact manager button
+    order_button = telebot.types.KeyboardButton("Заказать")
+
+
     markup.row(new_request_button)
     markup.row(cart_button, contact_manager_button)
+    markup.add(order_button)
     return markup
 
+if not pickup_points:
+    default_points = [
+        {"name": "Пункт выдачи 1", "address": "Адрес 1"},
+        {"name": "Пункт выдачи 2", "address": "Адрес 2"},
+        # ... more points
+    ]
+    save_data(default_points, PICKUP_POINTS_FILE)
+    pickup_points = load_data(PICKUP_POINTS_FILE)
 def serialize_markup(markup):
     """Сериализует reply_markup для сравнения."""
     return json.dumps(markup.to_dict(), sort_keys=True)
 
+
 if __name__ == '__main__':
     try:
+
         bot.infinity_polling(none_stop=True, timeout=90, long_polling_timeout=10)
     except Exception as e:
         print(f"Произошла ОШИБКА!: {e}")
+

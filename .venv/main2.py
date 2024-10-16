@@ -14,7 +14,7 @@ bot = telebot.TeleBot('8134752441:AAFmX7Tf1wbrjgsZoyniL3ELfGKlQhlSxPQ') #Remembe
 USER_DATA_FILE = "user_data.json"
 def load_user_data():
     try:
-        with open(USER_DATA_FILE, "r") as f:
+        with open(USER_DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):  # Handle missing or invalid JSON
         print("User data file not found or invalid JSON. Creating a new one.")
@@ -22,9 +22,10 @@ def load_user_data():
 
 def save_user_data():
     with open(USER_DATA_FILE, "w") as f:
-        json.dump(user_data, f, indent=4)
+        json.dump(user_data, f, indent=4,ensure_ascii=False)
 
 waiting_for_vin = False
+user_data = {}
 user_data = load_user_data()
 # Proxy list - replace with your actual proxies or a better proxy management system
 proxy_list = [
@@ -226,13 +227,17 @@ proxy_list = [
 ]
 
 
-def make_request(url, max_retries=3):
+def make_request(url, max_retries=3, headers=1):
     """Makes a request with proxy rotation and retry logic."""
     for attempt in range(max_retries):
         try:
             proxy = random.choice(proxy_list)
             proxies = {'http': proxy, 'https': proxy}
-            response = requests.get(url, proxies=proxies, timeout=15)
+            if headers == 1:
+                response = requests.get(url, proxies=proxies, timeout=15)
+            else:
+                response = requests.get(url, proxies=proxies, timeout=15,headers=headers)
+
             response.raise_for_status()
             return response
         except requests.exceptions.ProxyError as e:
@@ -247,7 +252,6 @@ def make_request(url, max_retries=3):
 
 
 def get_car_info(vin, chat_id):
-    load_user_data()
     url = "https://oem-catalog.rossko.ru/api/Search?query=" + vin
     response = make_request(url)
     if response:
@@ -275,6 +279,7 @@ def get_car_info(vin, chat_id):
                     "vin": vin,
                     "error_message_id": None,
                     "last_message_id": None,
+                    "cart": user_data[chat_id]['cart']
                 }
                 markup = telebot.types.InlineKeyboardMarkup()
                 markup.add(telebot.types.InlineKeyboardButton(text="Да", callback_data=f"confirm_{chat_id}"),
@@ -319,7 +324,7 @@ def get_details(ssd, vehicle_id, catalog_id, group_id, parent_group_id, catalog_
     else:
         bot.send_message(chat_id, "Не удалось получить детали. Попробуйте позже.")
 
-def add_to_cart(chat_id, part_oem):
+def add_to_cart(chat_id, part_oem,cross_type):
     if 'cart' not in user_data[chat_id]:
         user_data[chat_id]['cart'] = {}
 
@@ -327,11 +332,15 @@ def add_to_cart(chat_id, part_oem):
         user_data[chat_id]['cart'][part_oem]['quantity'] += 1
         save_user_data()
     else:
-        if chat_id in user_data and 'unit_data' in user_data[chat_id]:
+        if chat_id in user_data:
             part_dict = {part['oemCode']: part for part in user_data[chat_id]['unit_data']['parts']}
             if part_oem in part_dict:
-              user_data[chat_id]['cart'][part_oem] = {'name': part_dict[part_oem]['name'], 'quantity': 1}
-              save_user_data()
+                user_data[chat_id]['cart'][part_oem] = {
+                    'name': part_dict[part_oem]['name'],
+                    'quantity': 1,
+                    'cross_type': cross_type
+                }
+                save_user_data()
             else:
               return "Деталь не найдена в текущем юните."  # Or handle this differently
         else:
@@ -349,7 +358,7 @@ def view_cart(chat_id):
     cart_items = user_data[chat_id]['cart']
     message = "Товары в корзине:\n"
     for part_oem, part_data in cart_items.items():
-        message += f"- {part_data['name']} (Артикул: {part_oem}) x {part_data['quantity']}\n"
+        message += f"- {part_data['name']} (Артикул: {part_oem}, Тип: {part_data.get('cross_type', 'N/A')}) x {part_data['quantity']}\n"
     return message
 
 def ask_for_vin(message):
@@ -413,30 +422,98 @@ def create_back_button(current_state):
       return None
     return telebot.types.InlineKeyboardButton("Назад", callback_data=f"navigate_back")
 
+def get_part_details(chat_id, part_oem):
+    """Retrieves part name, cross type, and price."""
+    if chat_id in user_data and 'unit_data' in user_data[chat_id]:
+        parts = user_data[chat_id]['unit_data']['parts']
+        rossko_parts = user_data[chat_id]['unit_data']['rosskoParts'] # Access rosskoParts
+
+        for part in parts: # Iterate through parts to find the matching oemCode
+          if part['oemCode'] == part_oem:
+              nsi_part_id = part.get('nsiPartId', None)  # Get nsiPartId directly
+
+              if nsi_part_id:
+                  # Find the corresponding rosskoPart using nsiPartId
+                  rossko_part = next((rp for rp in rossko_parts if rp['id'] == nsi_part_id), None)
+                  if rossko_part:
+                      headers = {
+                        "Authorization-Domain": "https://don.rossko.ru",
+                        "Authorization-Session": "K-nMjOn2LUC2nSy2fLnJPMywn0CwDIDMvVBZ",  # ***IMPORTANT: See below***
+                      }
+                      url = f"https://productcard.rossko.ru/api/Product/Card/{nsi_part_id}?CurrencyCode=643&uin=&tariffTimings=true&newCart=true&addressGuid=&deliveryType=000000001&newClaimSystem=true"
+                      response = make_request(url,3,headers)
+                      if response:
+                          try:
+                              card_data = response.json()
+                              cross_type = card_data['mainPart']['crossType']
+                              stocks = card_data['mainPart'].get('stocks', [])
+
+                              if stocks:
+                                  prices = [stock['basePrice'] for stock in stocks]  # Get all prices
+
+                                  lowest_price = min(prices) if prices else "Цена не найдена"  # Handle no stocks case
+
+                                  formatted_price = "{:.2f} руб.".format(lowest_price) if isinstance(lowest_price, (
+                                  int, float)) else lowest_price
+                                  return part['name'], cross_type, formatted_price, prices  # return all prices
+                              else:
+                                  return part['name'], cross_type, "Цена не найдена"
+
+                          except (KeyError, json.JSONDecodeError, TypeError) as e: # Include TypeError
+                              print(f"Error getting product card details: {e}")
+                              return None, None, None, None
+                      else:
+                          print(f"Failed to get product card data for {nsi_part_id}")
+                          return None, None, None, None
+                  else:
+                      print(f"Corresponding rosskoPart not found for nsiPartId: {nsi_part_id}")
+                      return None, None, None, None
+              else:
+                  print("nsiPartId not found for this part.")
+                  return None, None, None, None
+
+    return None, None, None # Part not found in the data
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('part_'))
 def callback_query_part(call):
     part_oem = call.data.split('_')[1]
     chat_id = str(call.message.chat.id)
 
+    part_name, cross_type, price, price_list = get_part_details(chat_id, part_oem)
+
+    if part_name:
+        message = f"Название детали: {part_name}\nАртикул: {part_oem}\nТип: {cross_type}\nЦена: {price}"
+
+        # Split the message into chunks of 4096 characters or less
+        message_chunks = [message[i:i + 4096] for i in range(0, len(message), 4096)]
+
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton(
+            text="Добавить в корзину",
+            callback_data=f"add_to_cart_{part_oem}_{cross_type}"
+        ))
+
+        # Send each chunk as a separate message
+        for i, chunk in enumerate(message_chunks):
+            if i == len(message_chunks) - 1:  # Last chunk
+                bot.send_message(chat_id, chunk, reply_markup=markup)
+            else:
+                bot.send_message(chat_id, chunk)
+
+        # Send the keyboard with the last chunk (or a separate message if needed)
+    else:
+        bot.send_message(chat_id, f"Не могу найти деталь с артикулом: {part_oem}")
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton(text="Добавить в корзину", callback_data=f"add_to_cart_{part_oem}"))
 
 
-    if chat_id in user_data and 'unit_data' in user_data[chat_id]:
-        part_dict = {part['oemCode']: part['name'] for part in user_data[chat_id]['unit_data']['parts']}
-        if part_oem in part_dict:
-            bot.send_message(chat_id, f"Название детали: {part_dict[part_oem]}, Артикул: {part_oem}", reply_markup=markup)
-        else:
-            bot.send_message(chat_id, f"Не могу найти деталь с артикулом: {part_oem}")
-    else:
-      bot.send_message(chat_id, "Произошла ошибка, попробуйте снова.")
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('confirm_') or call.data.startswith('deny_'))
 def handle_confirmation_callback(call):
-    load_user_data()
+    chat_id = str(call.message.chat.id)
     global waiting_for_vin
     try:
-        chat_id = str(call.message.chat.id)
         if call.data.startswith('confirm_'):
             if chat_id in user_data and 'error_message_id' in user_data[chat_id] and user_data[chat_id]['error_message_id'] is not None:
                 try:
@@ -479,8 +556,11 @@ def handle_confirmation_callback(call):
 
 def get_unit_info(catalog_id, ssd, unit_id, catalog_type, catalog_aggregator, chat_id):
     data = user_data[chat_id]
+    headers = {
+        "Authorization-Domain": "https://don.rossko.ru",
+    }
     url = f"https://oem-catalog.rossko.ru/api/unit/info?catalogId={data['catalog_id']}&ssd={data['ssd']}&unitId={unit_id}&deliveryType=000000001&CurrencyCode=643&addressGuid=&catalogType={data['catalog_type']}&catalogAggregator={data['catalog_aggregator']}"
-    response = make_request(url)
+    response = make_request(url,3,headers)
     if response:
         try:
             unit_data = response.json()
@@ -489,6 +569,7 @@ def get_unit_info(catalog_id, ssd, unit_id, catalog_type, catalog_aggregator, ch
 
             if unit_data and unit_data.get('unit'):
                 text = "\nДетали в выбранном юните:\n"
+                print(url)
                 markup = telebot.types.InlineKeyboardMarkup()
                 part_dict = {part['oemCode']: part['name'] for part in unit_data['parts']}
 
@@ -527,7 +608,20 @@ def get_unit_info(catalog_id, ssd, unit_id, catalog_type, catalog_aggregator, ch
                     print(f"Ошибка при загрузке изображения: {e}")
                     bot.send_message(chat_id, f"Ошибка при загрузке изображения: {e}\nСсылка на фото (попробуйте вручную): {image_url}")
                     bot.send_message(chat_id, text, reply_markup=markup)
+                message_chunks = []
 
+                markup = telebot.types.InlineKeyboardMarkup()
+                for i in range(0, len(unit_data['parts']), 10):  # Adjust chunk size (10 here) as needed
+                    chunk_text = ""
+                    for j in range(10):
+                        index = i + j
+                        if index < len(unit_data['parts']):
+                            part = unit_data['parts'][index]
+                            part_name = part["name"]
+                            part_oem = part["oemCode"]
+                            part_code = part.get("codeOnImage", "")
+                            chunk_text += f'№{part_code}. {part_name}, Артикул: {part_oem}, \n\n'
+                    message_chunks.append(chunk_text)
             else:
                 bot.send_message(chat_id, "Информация о юните не найдена.")
         except json.JSONDecodeError as e:
@@ -681,11 +775,22 @@ def callback_query_remove_from_cart(call):
 def handle_start(message):
     global waiting_for_vin
     chat_id = str(message.chat.id)
+    import requests
 
-    user_data = load_user_data()
-    if chat_id not in user_data:  # Correctly initialize user data if it doesn't exist
-        user_data[chat_id] = {'vin': None, 'cart': {}, 'last_message_id': None}
 
+
+
+
+
+
+    if chat_id not in user_data:
+        user_data[chat_id] = {'vin': None, 'cart': {}}
+        save_user_data()  # Save after initializing
+    elif 'cart' not in user_data[chat_id]:  # initialize cart if it doesn't exist
+        user_data[chat_id]['cart'] = {}
+        save_user_data()
+    else:
+        print("yes")
     bot.send_message(chat_id, "Выберите действие:", reply_markup=create_main_menu(chat_id))
     if user_data[chat_id]['vin']:
         markup = telebot.types.InlineKeyboardMarkup()
@@ -697,10 +802,13 @@ def handle_start(message):
         ask_for_vin(message)
 
     save_user_data()
+    print(user_data[chat_id])
 @bot.callback_query_handler(func=lambda call: call.data == 'use_saved_vin')
 def use_saved_vin(call):
+
     chat_id = str(call.message.chat.id)
     vin = user_data[chat_id]['vin']
+    print(user_data[chat_id]['cart'])
     get_car_info(vin, chat_id)
 
 @bot.callback_query_handler(func=lambda call: call.data == 'enter_new_vin')
@@ -732,10 +840,11 @@ def handle_message(message):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('add_to_cart_'))
 def handle_add_to_cart(call):
-
-    part_oem = call.data.split('_')[3]
+    data = call.data.split('_')
+    part_oem = data[3]
+    cross_type = data[4]  # Get the cross_type from callback data
     chat_id = str(call.message.chat.id)
-    message = add_to_cart(chat_id, part_oem)
+    message = add_to_cart(chat_id, part_oem, cross_type)  # Pass cross_type to add_to_cart
     bot.answer_callback_query(call.id, text=message)
 
 
@@ -746,7 +855,7 @@ def callback_query_group(call):
     data = call.data.split("_")
     group_id = data[1]
     parent_group_id = data[2]
-    user_data = load_user_data()
+
     if "groups_data" not in user_data.get(chat_id, {}):
 
         waiting_for_vin = True
